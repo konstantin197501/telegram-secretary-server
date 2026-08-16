@@ -9,9 +9,13 @@ const {
   OPENAI_MODEL = "gpt-4.1-mini",
   TELEGRAM_SECRET_TOKEN,
   ASSISTANT_INSTRUCTIONS,
+  GPT_ACTION_KEY,
   BOT_MODE = "draft",
   PORT = 3000,
 } = process.env;
+
+const MAX_STORED_MESSAGES = 200;
+const storedMessages = [];
 
 const DEFAULT_ASSISTANT_INSTRUCTIONS = `
 Ты личный Telegram-секретарь Константина.
@@ -50,12 +54,78 @@ if (!OPENAI_API_KEY) {
 const telegramApi = (method) =>
   `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
 
+function requireGptActionKey(req, res, next) {
+  if (!GPT_ACTION_KEY) {
+    return res.status(503).json({
+      ok: false,
+      error: "GPT_ACTION_KEY is not configured.",
+    });
+  }
+
+  const received =
+    req.get("X-GPT-Action-Key") ||
+    req.get("Authorization")?.replace(/^Bearer\s+/i, "");
+
+  if (received !== GPT_ACTION_KEY) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  next();
+}
+
+function rememberMessage(message) {
+  storedMessages.unshift({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    stored_at: new Date().toISOString(),
+    ...message,
+  });
+
+  if (storedMessages.length > MAX_STORED_MESSAGES) {
+    storedMessages.length = MAX_STORED_MESSAGES;
+  }
+}
+
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "telegram-secretary-server",
     mode: BOT_MODE,
   });
+});
+
+app.get("/gpt/messages", requireGptActionKey, (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 20), 100);
+  res.json({
+    ok: true,
+    messages: storedMessages.slice(0, limit),
+  });
+});
+
+app.post("/gpt/send", requireGptActionKey, async (req, res) => {
+  const { chat_id: chatId, text, business_connection_id: businessConnectionId } =
+    req.body || {};
+
+  if (!chatId || !text) {
+    return res.status(400).json({
+      ok: false,
+      error: "chat_id and text are required.",
+    });
+  }
+
+  const result = await sendTelegramMessage({
+    chatId,
+    text,
+    businessConnectionId,
+  });
+
+  rememberMessage({
+    direction: "outgoing",
+    chat_id: chatId,
+    business_connection_id: businessConnectionId,
+    text,
+  });
+
+  res.json({ ok: true, telegram: result });
 });
 
 app.post("/webhook", async (req, res) => {
@@ -81,15 +151,38 @@ async function handleTelegramUpdate(update) {
     update.message ||
     update.edited_message;
 
-  if (!source || !source.text) {
+  if (!source) {
     return;
   }
 
   const chatId = source.chat?.id;
-  const text = source.text.trim();
+  const text = (source.text || source.caption || "").trim();
   const businessConnectionId = source.business_connection_id;
+  const attachments = describeAttachments(source);
 
-  if (!chatId || !text) {
+  if (!chatId) {
+    return;
+  }
+
+  rememberMessage({
+    direction: "incoming",
+    update_type: getUpdateType(update),
+    chat_id: chatId,
+    chat_type: source.chat?.type,
+    chat_title: source.chat?.title,
+    business_connection_id: businessConnectionId,
+    from_name: [source.from?.first_name, source.from?.last_name]
+      .filter(Boolean)
+      .join(" "),
+    username: source.from?.username,
+    text,
+    attachments,
+    telegram_date: source.date
+      ? new Date(source.date * 1000).toISOString()
+      : undefined,
+  });
+
+  if (!text) {
     return;
   }
 
@@ -110,6 +203,40 @@ async function handleTelegramUpdate(update) {
     text: finalText,
     businessConnectionId,
   });
+}
+
+function getUpdateType(update) {
+  if (update.business_message) return "business_message";
+  if (update.edited_business_message) return "edited_business_message";
+  if (update.message) return "message";
+  if (update.edited_message) return "edited_message";
+  return "unknown";
+}
+
+function describeAttachments(source) {
+  const attachments = [];
+
+  if (source.photo) {
+    attachments.push({
+      type: "photo",
+      file_id: source.photo.at(-1)?.file_id,
+      caption: source.caption,
+    });
+  }
+
+  for (const type of ["document", "voice", "audio", "video", "video_note", "sticker"]) {
+    if (source[type]) {
+      attachments.push({
+        type,
+        file_id: source[type].file_id,
+        file_name: source[type].file_name,
+        mime_type: source[type].mime_type,
+        caption: source.caption,
+      });
+    }
+  }
+
+  return attachments;
 }
 
 async function buildAssistantReply({ text, fromName }) {
@@ -156,7 +283,7 @@ async function buildAssistantReply({ text, fromName }) {
 async function sendTelegramMessage({ chatId, text, businessConnectionId }) {
   if (!TELEGRAM_BOT_TOKEN) {
     console.error("Cannot send Telegram message: TELEGRAM_BOT_TOKEN is not set.");
-    return;
+    return { ok: false, error: "TELEGRAM_BOT_TOKEN is not set." };
   }
 
   const payload = {
@@ -175,8 +302,12 @@ async function sendTelegramMessage({ chatId, text, businessConnectionId }) {
   });
 
   if (!response.ok) {
-    console.error("Telegram API error:", await response.text());
+    const errorText = await response.text();
+    console.error("Telegram API error:", errorText);
+    return { ok: false, error: errorText };
   }
+
+  return response.json();
 }
 
 if (!process.env.VERCEL) {
